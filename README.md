@@ -2,6 +2,8 @@
 
 A command-line Python tool for creating secure, auditable multiboot USB drives using GRUB2 bootloader. All code is transparent—uses only standard Linux tools and plain-text configuration.
 
+Note: Currently this project is not sufficiently tested. Please verify before using for production workflows.
+
 ## Why GRUB2?
 
 Unlike Ventoy:
