@@ -392,10 +392,14 @@ class GRUBInstaller:
 
     def generate_grub_config(self, isos: Dict[str, float], *, allow_wimboot_download: bool) -> str:
         """
-        Generate grub.cfg with robust distro detection.
+        Generate grub.cfg with robust distro detection and loopback cleanup.
         """
         # If Windows/Hiren detected, ensure wimboot is present (or warn).
-        has_windows = any(("win" in n.lower()) or ("hiren" in n.lower()) or ("gandalf" in n.lower()) or ("pe" in n.lower()) for n in isos.keys())
+        has_windows = any(
+            x for x in isos.keys() 
+            for term in ["win", "hiren", "hbcd", "pe", "gandalf"] 
+            if term in x.lower()
+        )
         if has_windows:
             self.ensure_wimboot(allow_download=allow_wimboot_download)
 
@@ -416,6 +420,8 @@ insmod loopback
 # Find partitions by label
 search --no-floppy --label BOOT --set=bootpart
 search --no-floppy --label ISOs --set=isopart
+# Get UUID of ISO partition for Linux kernels (crucial for SystemRescue/Arch)
+probe -u $isopart --set=isouuid
 
 if [ -z "$isopart" ]; then
   echo "ERROR: ISO partition label 'ISOs' not found."
@@ -438,9 +444,10 @@ fi
             isofile = f"/isos/{iso_name}"
             low = iso_name.lower()
 
-            # Windows / WinPE / Hiren's / Gandalf (BIOS/CSM)
-            if any(x in low for x in ["hiren", "gandalf", "win10", "win11", "windows", "winpe"]):
+            # 1. Windows / WinPE / Hiren's / Gandalf (BIOS/CSM)
+            if any(x in low for x in ["hiren", "hbcd", "gandalf", "win10", "win11", "windows", "winpe", "pe_x64"]):
                 body = f"""  set isofile="{isofile}"
+  loopback --delete loop
   loopback loop ($isopart)$isofile
   if [ -z "$wimboot" ]; then
     echo "wimboot not found at ($bootpart)/grub/wimboot"
@@ -448,8 +455,10 @@ fi
     sleep 3
   else
     linux16 $wimboot
+    # Map bootmgr.exe specifically (case sensitive usually check both)
+    # Hiren's often has it at root.
     initrd16 \\
-      newc:bootmgr:(loop)/bootmgr \\
+      newc:bootmgr:(loop)/bootmgr.exe \\
       newc:bcd:(loop)/boot/bcd \\
       newc:boot.sdi:(loop)/boot/boot.sdi \\
       newc:boot.wim:(loop)/sources/boot.wim
@@ -458,9 +467,10 @@ fi
                 cfg += _menuentry(f"{label} (Windows/PE)", body)
                 continue
 
-            # Tails (Debian live w/ extra args)
+            # 2. Tails (Debian live w/ extra args)
             if "tails" in low:
                 body = f"""  set isofile="{isofile}"
+  loopback --delete loop
   loopback loop ($isopart)$isofile
   linux (loop)/live/vmlinuz boot=live config findiso=$isofile live-media=removable apparmor=1 security=apparmor nopersistence noprompt timezone=Etc/UTC block.events_dfl_poll_msecs=1000 splash noautologin module=Tails
   initrd (loop)/live/initrd.img
@@ -468,12 +478,32 @@ fi
                 cfg += _menuentry(label, body)
                 continue
 
-            # Debian-live family (SystemRescue, Clonezilla, GParted Live, Kali live, Debian live)
-            if any(x in low for x in ["systemrescue", "system-rescue", "clonezilla", "gparted", "debian", "kali"]):
+            # 3. SystemRescue (Modern Arch-based versions 6.0+)
+            if "systemrescue" in low or "sysresccd" in low:
+                body = f"""  set isofile="{isofile}"
+  loopback --delete loop
+  loopback loop ($isopart)$isofile
+  # Modern SystemRescue (Arch-based)
+  if [ -e (loop)/sysresccd/boot/x86_64/vmlinuz ]; then
+      # Use UUID for img_dev (fix for 'device did not show up')
+      linux (loop)/sysresccd/boot/x86_64/vmlinuz archisobasedir=sysresccd archisolabel=RESCUE* img_dev=/dev/disk/by-uuid/$isouuid img_loop=$isofile earlymodules=loop
+      initrd (loop)/sysresccd/boot/x86_64/sysresccd.img
+  else
+      # Fallback for older Debian-based versions (<6.0)
+      linux (loop)/isolinux/rescue64 isoloop=$isofile
+      initrd (loop)/isolinux/initram.igz
+  fi
+"""
+                cfg += _menuentry(label, body)
+                continue
+
+            # 4. Debian-live family (Clonezilla, GParted Live, Kali, Debian)
+            if any(x in low for x in ["clonezilla", "gparted", "debian", "kali"]):
                 extra = ""
                 if "clonezilla" in low:
                     extra = "union=overlay components quiet noswap"
                 body = f"""  set isofile="{isofile}"
+  loopback --delete loop
   loopback loop ($isopart)$isofile
   linux (loop)/live/vmlinuz boot=live findiso=$isofile {extra}
   initrd (loop)/live/initrd.img
@@ -481,10 +511,12 @@ fi
                 cfg += _menuentry(label, body)
                 continue
 
-            # Arch family (Arch, Manjaro, EndeavourOS)
+            # 5. Arch family (Arch, Manjaro, EndeavourOS)
             if any(x in low for x in ["arch", "manjaro", "endeavouros", "endeavour"]):
                 body = f"""  set isofile="{isofile}"
+  loopback --delete loop
   loopback loop ($isopart)$isofile
+  # Probe UUID for robustness
   probe -u ($isopart) --set=isouuid
   linux (loop)/arch/boot/x86_64/vmlinuz-linux archisobasedir=arch img_dev=/dev/disk/by-uuid/$isouuid img_loop=$isofile earlymodules=loop
   initrd (loop)/arch/boot/x86_64/initramfs-linux.img
@@ -492,9 +524,10 @@ fi
                 cfg += _menuentry(label, body)
                 continue
 
-            # Fedora/RHEL family (best-effort)
+            # 6. Fedora/RHEL family (best-effort)
             if any(x in low for x in ["fedora", "rhel", "centos", "rocky", "alma"]):
                 body = f"""  set isofile="{isofile}"
+  loopback --delete loop
   loopback loop ($isopart)$isofile
   linux (loop)/images/pxeboot/vmlinuz iso-scan/filename=$isofile rd.live.image quiet
   initrd (loop)/images/pxeboot/initrd.img
@@ -502,9 +535,10 @@ fi
                 cfg += _menuentry(label, body)
                 continue
 
-            # NixOS (best-effort)
+            # 7. NixOS (best-effort)
             if "nixos" in low:
                 body = f"""  set isofile="{isofile}"
+  loopback --delete loop
   loopback loop ($isopart)$isofile
   linux (loop)/boot/bzImage findiso=$isofile
   initrd (loop)/boot/initrd
@@ -512,18 +546,9 @@ fi
                 cfg += _menuentry(label, body)
                 continue
 
-            # Proxmox (Experimental)
-            if "proxmox" in low:
-                body = f"""  set isofile="{isofile}"
-  loopback loop ($isopart)$isofile
-  linux (loop)/boot/linux26 ro ramdisk_size=16777216 rw quiet splash=verbose proxmox-start-auto
-  initrd (loop)/boot/initrd.img
-"""
-                cfg += _menuentry(f"{label} (Proxmox - Experimental)", body)
-                continue
-
-            # Ubuntu/casper family (Ubuntu/Mint/Pop!/etc.) fallback
+            # 8. Ubuntu/casper family (Ubuntu/Mint/Pop!/etc.) fallback
             body = f"""  set isofile="{isofile}"
+  loopback --delete loop
   loopback loop ($isopart)$isofile
   linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=$isofile noeject noprompt splash --
   initrd (loop)/casper/initrd
