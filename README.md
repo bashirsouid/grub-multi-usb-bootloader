@@ -2,7 +2,7 @@
 
 A command-line Python tool for creating secure, auditable multiboot USB drives using GRUB2 bootloader. All code is transparent—uses only standard Linux tools and plain-text configuration.
 
-Note: Currently this project is not sufficiently tested. Please verify before using for production workflows.
+**Note:** Currently this project is under active development. Test thoroughly before using in production workflows.
 
 ## Why GRUB2?
 
@@ -16,9 +16,10 @@ Unlike Ventoy:
 
 - **Dual mode**: Interactive prompts OR command-line automation
 - **Safe by default**: Dry-run mode, lists all disks, confirms before changes
-- **Flexible**: Fresh install OR update ISOs on existing USB
+- **Flexible**: Create GRUB-only USB OR add ISO files later
+- **Optional ISOs**: `--iso-dir` is optional; create empty USB and drag-and-drop ISOs manually
 - **Large file support**: Optional exFAT partition for ISOs >4GB
-- **Idempotent**: Can detect and preserve existing GRUB2 installations
+- **Minimal boot partition**: Default 256 MB (just enough for GRUB + config)
 
 ## Installation
 
@@ -46,29 +47,35 @@ pip install -r requirements.txt
 
 ## Quick Start
 
-### 1. Prepare ISOs
+### Option 1: With ISO Files
 
 ```bash
+# Prepare ISOs
 mkdir ~/multiboot-isos
 cp ~/Downloads/*.iso ~/multiboot-isos/
-```
 
-### 2. Run in Dry-Run Mode (Safe Preview)
-
-```bash
+# Dry-run preview (safe)
 python3 main.py --iso-dir ~/multiboot-isos
+
+# Execute (requires sudo)
+sudo python3 main.py --iso-dir ~/multiboot-isos --device /dev/sdb --auto-confirm --no-dry-run
 ```
 
-The script will:
-1. List all USB devices (confirm selection)
-2. Show ISO files found
-3. Display all operations planned
-4. **Stop before making any changes**
-
-### 3. Execute (When Ready)
+### Option 2: Empty GRUB-Only USB (Add ISOs Later)
 
 ```bash
-python3 main.py --iso-dir ~/multiboot-isos --device /dev/sdb --auto-confirm --no-dry-run
+# Dry-run preview
+python3 main.py --device /dev/sdb --dry-run
+
+# Execute (requires sudo)
+sudo python3 main.py --device /dev/sdb --auto-confirm --no-dry-run
+```
+
+Then manually copy ISOs to the USB:
+```bash
+mount /dev/sdb2 /mnt/usb-iso
+cp ~/Downloads/*.iso /mnt/usb-iso/isos/
+umount /mnt/usb-iso
 ```
 
 ## Usage
@@ -76,81 +83,84 @@ python3 main.py --iso-dir ~/multiboot-isos --device /dev/sdb --auto-confirm --no
 ### Interactive Mode (Recommended)
 
 ```bash
-python3 main.py --iso-dir ~/multiboot-isos
+python3 main.py
 ```
 
-Prompts for:
-- USB device selection (with sizes)
-- Confirmation before formatting
+The script will:
+1. List all USB devices and prompt for selection
+2. Show ISOs found (if `--iso-dir` provided)
+3. Display all planned operations
+4. Require you to confirm before making changes
 
-### Fully Automated
-
-```bash
-python3 main.py \
-  --iso-dir ~/multiboot-isos \
-  --device /dev/sdb \
-  --mount-point /mnt/usb \
-  --boot-size 2 \
-  --iso-format ext4 \
-  --auto-confirm \
-  --dry-run
-```
-
-Remove `--dry-run` to execute:
+### Fully Automated (with ISOs)
 
 ```bash
-python3 main.py \
+sudo python3 main.py \
   --iso-dir ~/multiboot-isos \
   --device /dev/sdb \
   --auto-confirm \
   --no-dry-run
 ```
 
+### Fully Automated (empty USB)
+
+```bash
+sudo python3 main.py \
+  --device /dev/sdb \
+  --auto-confirm \
+  --no-dry-run
+```
+
+### Dry-Run Preview (Safe)
+
+```bash
+python3 main.py --iso-dir ~/multiboot-isos --device /dev/sdb --auto-confirm
+```
+
+This shows all operations without executing them.
+
 ### Command-Line Options
 
 ```
---iso-dir, -i           Directory containing ISO files (required)
---device, -d            USB device path (e.g., /dev/sdb)
---mount-point, -m       Mount point for USB (default: /mnt/usb)
---boot-size             Boot partition size in GB (default: 2)
---iso-format            ext4 or exfat (default: ext4)
---dry-run               Preview mode (default: enabled)
---no-dry-run            Execute changes (destructive!)
---auto-confirm          Skip confirmation prompts (for automation)
---help, -h              Show help message
+--iso-dir, -i              Directory with ISO files (optional)
+--device, -d               USB device path (e.g., /dev/sdb)
+--mount-point, -m          Mount point for USB (default: /mnt/usb)
+--boot-size-mb             Boot partition size in MB (default: 256)
+--iso-format               ext4 or exfat (default: ext4)
+--dry-run                  Preview mode (default: enabled)
+--no-dry-run               Execute changes (destructive! requires root)
+--auto-confirm             Skip confirmation prompts (for automation)
+--help, -h                 Show help message
 ```
 
 ## Workflow
 
-### Fresh USB Setup
+### Fresh USB Setup with ISOs
 
 1. **Wipe device** - Removes all data
 2. **Create partitions**:
-   - Partition 1: Boot (ext4, user-specified size, default 2GB)
+   - Partition 1: Boot (ext4, default 256 MB)
    - Partition 2: ISOs (ext4 or exFAT, remaining space)
 3. **Mount partitions**
 4. **Install GRUB2** - Installs bootloader to boot sector
-5. **Copy ISOs** - Copies all ISO files to ISO partition
-6. **Generate GRUB config** - Creates grub.cfg with multiboot menu entries
+5. **Copy ISOs** - Copies all ISO files to `/isos` folder
+6. **Generate GRUB config** - Creates `grub.cfg` with multiboot menu entries
 7. **Unmount** - Safely ejects USB
 
-### Updating Existing USB
+### Fresh USB Setup (Empty, Add ISOs Later)
 
-If the device already has GRUB2 installed, the script will:
-- Detect existing installation
-- Skip format/partition steps
-- Update ISOs and regenerate GRUB configuration
+Same as above, but step 5 is skipped. The `/isos` folder is created but empty.
 
 ## Partition Layout
 
 ```
 /dev/sdbX (Master Boot Record)
-├── /dev/sdb1 (Boot, ext4, 2GB)
+├── /dev/sdb1 (Boot, ext4, 256 MB)
 │   ├── /boot/grub/              (GRUB2 files)
 │   └── /boot/grub/grub.cfg      (Menu configuration)
 └── /dev/sdb2 (ISOs, ext4, ~remaining)
     └── /isos/                   (ISO files folder)
-        ├── ubuntu-24.04.iso
+        ├── ubuntu-24.04.iso     (optional - add manually or via --iso-dir)
         ├── debian-12.iso
         └── ...
 ```
@@ -159,10 +169,10 @@ If the device already has GRUB2 installed, the script will:
 
 The generated `grub.cfg` includes:
 
-- **Multiboot menu entries** for each ISO (one per file)
+- **Multiboot menu entries** for each ISO (if any present)
 - **Loopback mounting** for efficient kernel loading
 - **System utilities**: UEFI firmware settings, reboot, shutdown
-- **Timeout**: 10 seconds (editable)
+- **Timeout**: 10 seconds (editable in `/boot/grub/grub.cfg`)
 
 Example menu entry:
 
@@ -184,12 +194,12 @@ No special configuration needed. Works out-of-the-box.
 
 ### UEFI with Secure Boot Enabled
 
-GRUB2 on this USB will prompt for MOK (Machine Owner Key) enrollment:
+GRUB2 on this USB may prompt for MOK (Machine Owner Key) enrollment:
 
 1. Boot USB in UEFI mode
-2. GRUB starts normally
+2. GRUB menu appears
 3. Select "Enroll MOK" (if prompted)
-4. Follow enrollment steps
+4. Complete enrollment flow
 5. Reboot to use
 
 For detailed guidance: [Ubuntu Secure Boot Documentation](https://wiki.ubuntu.com/SecureBoot)
@@ -199,10 +209,10 @@ For detailed guidance: [Ubuntu Secure Boot Documentation](https://wiki.ubuntu.co
 ext4 has a 4GB file size limit. For larger ISOs:
 
 ```bash
-python3 main.py --iso-dir ~/multiboot-isos --iso-format exfat
+sudo python3 main.py --iso-dir ~/multiboot-isos --iso-format exfat --no-dry-run
 ```
 
-This creates the ISO partition as exFAT instead.
+This creates the ISO partition as exFAT instead, supporting files >4GB.
 
 ## Troubleshooting
 
@@ -220,18 +230,16 @@ lsblk
 
 Then specify the correct device path.
 
-### Permission Denied
+### Permission Denied (--no-dry-run)
 
 ```
-✗ Command failed: ['sudo', 'parted', ...]
+✗ --no-dry-run requires root.
 ```
 
-**Solution**: Script uses `sudo` for privileged operations. You may see a password prompt.
-
-If passwordless sudo is configured:
+**Solution**: Use `sudo` when executing changes:
 
 ```bash
-sudo python3 main.py --iso-dir ~/isos --device /dev/sdb --no-dry-run --auto-confirm
+sudo python3 main.py --device /dev/sdb --no-dry-run --auto-confirm
 ```
 
 ### ISO Not Booting
@@ -243,35 +251,66 @@ sudo python3 main.py --iso-dir ~/isos --device /dev/sdb --no-dry-run --auto-conf
 
 2. Check if file was copied:
    ```bash
-   ls -lh /mnt/usb/isos/
+   mount /dev/sdb2 /mnt/usb-iso
+   ls -lh /mnt/usb-iso/isos/
+   umount /mnt/usb-iso
    ```
 
 3. Verify GRUB config:
    ```bash
-   cat /mnt/usb/boot/grub/grub.cfg
+   mount /dev/sdb1 /mnt/usb-boot
+   cat /mnt/usb-boot/grub/grub.cfg
+   umount /mnt/usb-boot
    ```
 
 4. Some distros require custom kernel parameters—edit `grub.cfg` manually if needed.
 
 ### Stuck in Dry-Run
 
-Running with `--dry-run` (default). Remove it:
+Running with `--dry-run` (default) performs no operations. To execute:
 
 ```bash
-python3 main.py --iso-dir ~/isos --device /dev/sdb --no-dry-run --auto-confirm
+sudo python3 main.py --device /dev/sdb --no-dry-run --auto-confirm
+```
+
+## Adding ISOs Manually
+
+If you created an empty USB, you can add ISOs later:
+
+```bash
+# Mount the ISO partition
+sudo mount /dev/sdb2 /mnt/iso-partition
+
+# Copy ISOs
+cp ~/Downloads/*.iso /mnt/iso-partition/isos/
+
+# Update grub.cfg (optional - GRUB will auto-detect ISOs)
+# Edit /mnt/usb-boot/grub/grub.cfg if needed
+
+# Unmount
+sudo umount /mnt/iso-partition
 ```
 
 ## Security & Auditing
 
 - **No network calls** - Fully offline operation
 - **No telemetry** - Code doesn't phone home
-- **Source code available** - All code is plain-text Python
+- **Source code available** - All code is plain-text Python (~450 lines)
 - **Standard tools only** - Uses GRUB2, parted, mkfs from your distro
 - **Reproducible** - Same inputs produce identical results
+
+To audit the code:
+```bash
+python3 -m py_compile main.py  # Syntax check
+grep -n "subprocess" main.py   # View all external commands
+wc -l main.py                  # Line count
+```
 
 ## License
 
 GNU General Public License v2.0 (GPLv2)
+
+See LICENSE file for details.
 
 ## Related Resources
 
@@ -281,5 +320,6 @@ GNU General Public License v2.0 (GPLv2)
 
 ---
 
-**Last Updated**: 2025-12-24  
-**License**: GPLv2
+**Last Updated**: 2025-12-25  
+**License**: GPLv2  
+**Status**: Development

@@ -232,16 +232,24 @@ class GRUBInstaller:
             needs_sudo=True,
         )
 
-    def copy_isos(self, iso_dir: Path) -> Dict[str, float]:
+    def copy_isos(self, iso_dir: Optional[Path]) -> Dict[str, float]:
         """Copy ISO files to USB."""
         print("\n📝 Copying ISO files...")
-
+        
+        # Always create the folder structure
         iso_folder = self.iso_mount / "isos"
-        isos = {}
-        iso_files = sorted(iso_dir.glob("*.iso"))
+        if not self.dry_run:
+            iso_folder.mkdir(exist_ok=True)
 
+        isos = {}
+        
+        if not iso_dir:
+            print("   (No ISO directory specified - skipping copy)")
+            return isos
+
+        iso_files = sorted(iso_dir.glob("*.iso"))
         if not iso_files:
-            print("⚠️  No ISO files found")
+            print("⚠️  No ISO files found in directory")
             return isos
 
         for iso_file in iso_files:
@@ -250,7 +258,6 @@ class GRUBInstaller:
             print(f"   {iso_file.name:50} {size_gb:6.2f} GB")
 
             if not self.dry_run:
-                iso_folder.mkdir(exist_ok=True)  # <--- MOVED INSIDE CHECK
                 dst = iso_folder / iso_file.name
                 shutil.copy2(iso_file, dst)
 
@@ -343,7 +350,7 @@ Examples:
         """,
     )
 
-    parser.add_argument("--iso-dir", "-i", required=True, help="Directory with ISO files")
+    parser.add_argument("--iso-dir", "-i", help="Directory with ISO files")
     parser.add_argument("--device", "-d", help="USB device (e.g., /dev/sdb)")
     parser.add_argument("--mount-point", "-m", default="/mnt/usb", help="Mount point")
     parser.add_argument(
@@ -372,11 +379,13 @@ Examples:
         print("  Re-run as: sudo python3 main.py ...")
         sys.exit(1)
 
-    # Verify ISO directory exists
-    iso_dir = Path(args.iso_dir).expanduser()
-    if not iso_dir.exists():
-        print(f"✗ ISO directory not found: {iso_dir}")
-        sys.exit(1)
+    # Verify ISO directory if provided
+    iso_dir = None
+    if args.iso_dir:
+        iso_dir = Path(args.iso_dir).expanduser()
+        if not iso_dir.exists():
+            print(f"✗ ISO directory not found: {iso_dir}")
+            sys.exit(1)
 
     # Interactive device selection if needed
     device = args.device
@@ -403,7 +412,7 @@ Examples:
     print("\n" + "=" * 60)
     print("GRUB2 Multiboot USB Creator")
     print("=" * 60)
-    print(f"ISO Directory:   {iso_dir}")
+    print(f"ISO Directory:   {iso_dir if iso_dir else '(None - creating empty folder)'}")
     print(f"USB Device:      {device}")
     print(f"Mount Point:     {args.mount_point}")
     print(f"Boot Size:       {args.boot_size_mb} MB")
@@ -426,7 +435,7 @@ Examples:
     installer.mount_partitions()
     installer.install_grub()
 
-    # Step 3: Copy ISOs and configure GRUB
+    # Step 3: Copy ISOs (if any) and configure GRUB
     isos = installer.copy_isos(iso_dir)
     config = installer.generate_grub_config(isos)
     installer.write_grub_config(config)
