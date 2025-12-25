@@ -10,8 +10,7 @@ Supports:
   - Dry-run by default
   - Optional --iso-dir (skip copying; still generates config from existing ISOs on USB)
   - Interactive prompt for ISO directory if not specified
-  - Update mode (regenerate grub.cfg + sync ISOs) without wiping
-  - Wipe mode (repartition/format/install grub)
+  - Interactive prompt for Mode (Update vs Wipe) if existing partitions found
   - Fixes ISO directory ownership so the invoking (sudo) user can manage files
   - Windows/PE/Hiren's support via wimboot
 """
@@ -393,10 +392,7 @@ class GRUBInstaller:
 
     def generate_grub_config(self, isos: Dict[str, float], *, allow_wimboot_download: bool) -> str:
         """
-        Generate grub.cfg.
-
-        Important: BOOT and ISOs are on separate partitions, so we search the ISO partition
-        by label and loopback from there.
+        Generate grub.cfg with robust distro detection.
         """
         # If Windows/Hiren detected, ensure wimboot is present (or warn).
         has_windows = any(("win" in n.lower()) or ("hiren" in n.lower()) or ("gandalf" in n.lower()) or ("pe" in n.lower()) for n in isos.keys())
@@ -474,7 +470,6 @@ fi
 
             # Debian-live family (SystemRescue, Clonezilla, GParted Live, Kali live, Debian live)
             if any(x in low for x in ["systemrescue", "system-rescue", "clonezilla", "gparted", "debian", "kali"]):
-                # Clonezilla/GParted often need specific union options, but generic often works or prompts
                 extra = ""
                 if "clonezilla" in low:
                     extra = "union=overlay components quiet noswap"
@@ -589,7 +584,7 @@ def main() -> None:
         "--mode",
         choices=["auto", "wipe", "update"],
         default="auto",
-        help="auto: update if already set up else wipe; wipe: force wipe; update: never wipe.",
+        help="auto: detect existing setup; wipe: force wipe; update: only sync ISOs/config.",
     )
 
     parser.add_argument(
@@ -643,25 +638,34 @@ def main() -> None:
     formatter = USBFormatter(device, dry_run=args.dry_run)
     already = formatter.device_has_layout()
 
-    # Resolve mode
+    # --- Mode Resolution ---
     mode = args.mode
     if mode == "auto":
-        mode = "update" if already else "wipe"
+        if already:
+            # If auto-confirm is ON, we assume 'update' is the safe desired action for automation.
+            # If auto-confirm is OFF (interactive), we MUST ask the user.
+            if args.auto_confirm:
+                mode = "update"
+            else:
+                print(f"\n⚠️  Existing multiboot partitions detected on {device}.")
+                print("   [u] Update: Sync ISOs & update menu (preserves existing data)")
+                print("   [w] Wipe:   Erase everything and start fresh")
+                while True:
+                    ans = input("Select mode [u/w]: ").lower().strip()
+                    if ans.startswith("u"):
+                        mode = "update"
+                        break
+                    elif ans.startswith("w"):
+                        mode = "wipe"
+                        break
+        else:
+            mode = "wipe"
 
-    # Interactive confirmations
-    if not args.auto_confirm:
-        if mode == "wipe":
-            formatter.confirm_wipe()
-        elif mode == "update" and not already:
-            print("⚠️  Update mode selected but device does not look pre-initialized.")
-            response = input("Proceed anyway (mount + write config only)? [yes/NO]: ").strip().lower()
-            if response != "yes":
-                print("Aborted.")
-                sys.exit(0)
-        elif mode == "update" and already:
-            print("ℹ️  Existing setup detected; will UPDATE (no wipe).")
+    # If wiping, confirm again (safety)
+    if mode == "wipe" and not args.auto_confirm:
+        formatter.confirm_wipe()
 
-    # Interactive ISO selection (if not provided & not auto-confirm)
+    # Interactive ISO selection (optional, if not provided)
     if iso_dir is None and not args.auto_confirm:
         print("\n💿 Optional: Path to ISO directory to pre-seed?")
         while True:
@@ -679,7 +683,7 @@ def main() -> None:
     print("GRUB2 Multiboot USB Creator")
     print("=" * 60)
     print(f"USB Device:      {device}")
-    print(f"Mode:            {mode}")
+    print(f"Mode:            {mode.upper()}")
     print(f"ISO Directory:   {iso_dir if iso_dir else '(none)'}")
     print(f"Mount Point:     {args.mount_point}")
     print(f"Boot Size:       {args.boot_size_mb} MB")
