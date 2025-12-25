@@ -49,10 +49,20 @@ class USBFormatter:
 
     def list_disks(self) -> List[Dict]:
         """List all block devices with sizes."""
-        ret, output = self.run_cmd(["lsblk", "-bdno", "NAME,SIZE,TYPE"], needs_sudo=False)
-
-        if ret != 0:
+        # Always execute this (not affected by dry_run) - it's just reading state
+        try:
+            result = subprocess.run(
+                ["lsblk", "-bdno", "NAME,SIZE,TYPE"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            output = result.stdout
+        except subprocess.CalledProcessError:
             print("✗ Failed to detect disks")
+            sys.exit(1)
+        except FileNotFoundError:
+            print("✗ lsblk not found")
             sys.exit(1)
 
         devices = []
@@ -100,26 +110,29 @@ class USBFormatter:
         print("\n🗑️  Wiping device...")
         self.run_cmd(["wipefs", "-a", self.device], needs_sudo=True)
 
-    def create_partitions(self, boot_size_gb: int = 2):
+    def create_partitions(self, boot_size_mb: int = 256, iso_format: str = "ext4"):
         """Create partition table and partitions."""
         print("\n📂 Creating partition layout...")
-        print(f"   Partition 1 (Boot):  {boot_size_gb} GB")
-        print(f"   Partition 2 (ISOs):  Remaining space")
+        print(f"   Partition 1 (Boot):  {boot_size_mb} MB")
+        print("   Partition 2 (ISOs):  Remaining space")
 
         # MBR partition table
         self.run_cmd(["parted", "-s", self.device, "mklabel", "msdos"], needs_sudo=True)
 
+        # Align partition 1 to 1MiB
+        start = "1MiB"
+        end = f"{boot_size_mb + 1}MiB"
+
         # Boot partition (ext4)
-        boot_end = f"{boot_size_gb}GB"
         self.run_cmd(
-            ["parted", "-s", self.device, "mkpart", "primary", "ext4", "0", boot_end],
+            ["parted", "-s", self.device, "mkpart", "primary", "ext4", start, end],
             needs_sudo=True,
         )
         self.run_cmd(["parted", "-s", self.device, "set", "1", "boot", "on"], needs_sudo=True)
 
-        # ISO partition
+        # ISO partition (ext4 or exfat)
         self.run_cmd(
-            ["parted", "-s", self.device, "mkpart", "primary", "ext4", boot_end, "100%"],
+            ["parted", "-s", self.device, "mkpart", "primary", iso_format, end, "100%"],
             needs_sudo=True,
         )
 
@@ -180,6 +193,11 @@ class GRUBInstaller:
         """Mount USB partitions."""
         print("\n🔗 Mounting partitions...")
 
+        if self.dry_run:
+            print(f"   {self.boot_partition} → {self.boot_mount}")
+            print(f"   {self.iso_partition} → {self.iso_mount}")
+            return  # <--- RETURN EARLY IN DRY RUN
+
         self.mount_point.mkdir(parents=True, exist_ok=True)
         self.boot_mount.mkdir(exist_ok=True)
         self.iso_mount.mkdir(exist_ok=True)
@@ -193,6 +211,10 @@ class GRUBInstaller:
     def install_grub(self):
         """Install GRUB2 bootloader."""
         print("\n🔧 Installing GRUB2...")
+
+        if self.dry_run:
+            print(f"   → grub-install --force --no-floppy --boot-directory={self.boot_mount} {self.device}")
+            return  # <--- RETURN EARLY IN DRY RUN
 
         # Create boot directory structure
         grub_dir = self.boot_mount / "grub"
@@ -215,8 +237,6 @@ class GRUBInstaller:
         print("\n📝 Copying ISO files...")
 
         iso_folder = self.iso_mount / "isos"
-        iso_folder.mkdir(exist_ok=True)
-
         isos = {}
         iso_files = sorted(iso_dir.glob("*.iso"))
 
@@ -230,6 +250,7 @@ class GRUBInstaller:
             print(f"   {iso_file.name:50} {size_gb:6.2f} GB")
 
             if not self.dry_run:
+                iso_folder.mkdir(exist_ok=True)  # <--- MOVED INSIDE CHECK
                 dst = iso_folder / iso_file.name
                 shutil.copy2(iso_file, dst)
 
@@ -293,11 +314,15 @@ menuentry "Power Off" {
         """Safely unmount USB."""
         print("\n🔌 Unmounting...")
 
+        if self.dry_run:
+            print(f"   {self.boot_mount}")
+            print(f"   {self.iso_mount}")
+            return  # <--- RETURN EARLY IN DRY RUN
+
         for mount in [self.boot_mount, self.iso_mount]:
             if mount.exists():
                 print(f"   {mount}")
                 subprocess.run(["sudo", "umount", str(mount)], capture_output=True)
-
 
 def main():
     import argparse
@@ -321,7 +346,13 @@ Examples:
     parser.add_argument("--iso-dir", "-i", required=True, help="Directory with ISO files")
     parser.add_argument("--device", "-d", help="USB device (e.g., /dev/sdb)")
     parser.add_argument("--mount-point", "-m", default="/mnt/usb", help="Mount point")
-    parser.add_argument("--boot-size", type=int, default=2, help="Boot partition size (GB)")
+    parser.add_argument(
+        "--boot-size-mb", "--boot-size",
+        dest="boot_size_mb",
+        type=int,
+        default=256,
+        help="Boot partition size in MB (default: 256).",
+    )
     parser.add_argument(
         "--iso-format",
         choices=["ext4", "exfat"],
@@ -335,6 +366,11 @@ Examples:
     parser.add_argument("--auto-confirm", action="store_true", help="Skip confirmation prompts")
 
     args = parser.parse_args()
+
+    if not args.dry_run and os.geteuid() != 0:
+        print("✗ --no-dry-run requires root.")
+        print("  Re-run as: sudo python3 main.py ...")
+        sys.exit(1)
 
     # Verify ISO directory exists
     iso_dir = Path(args.iso_dir).expanduser()
@@ -370,7 +406,7 @@ Examples:
     print(f"ISO Directory:   {iso_dir}")
     print(f"USB Device:      {device}")
     print(f"Mount Point:     {args.mount_point}")
-    print(f"Boot Size:       {args.boot_size} GB")
+    print(f"Boot Size:       {args.boot_size_mb} MB")
     print(f"ISO Format:      {args.iso_format}")
     print(f"Dry-Run Mode:    {args.dry_run}")
     print("=" * 60)
@@ -382,7 +418,7 @@ Examples:
         formatter.confirm_device()
 
     formatter.wipe_device()
-    formatter.create_partitions(args.boot_size)
+    formatter.create_partitions(args.boot_size_mb, args.iso_format)
     formatter.format_partitions(args.iso_format)
 
     # Step 2: Install GRUB
