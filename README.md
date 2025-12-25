@@ -17,7 +17,6 @@ Unlike Ventoy:
 - **Flexible**: Fresh install OR update ISOs on existing USB
 - **Large file support**: Optional exFAT partition for ISOs >4GB
 - **Idempotent**: Can detect and preserve existing GRUB2 installations
-- **Infrastructure-ready**: Full automation for CI/CD pipelines
 
 ## Installation
 
@@ -260,61 +259,6 @@ Running with `--dry-run` (default). Remove it:
 python3 main.py --iso-dir ~/isos --device /dev/sdb --no-dry-run --auto-confirm
 ```
 
-## Infrastructure Automation
-
-### Ansible Example
-
-```yaml
-- name: Create multiboot USB
-  command: >
-    python3 main.py
-    --iso-dir /opt/isos
-    --device /dev/sdb
-    --boot-size 2
-    --auto-confirm
-    --no-dry-run
-  register: usb_creation
-  changed_when: "'Multiboot USB ready' in usb_creation.stderr"
-```
-
-### Bash Script (Idempotent)
-
-```bash
-#!/bin/bash
-set -e
-
-ISO_DIR=/opt/isos
-USB_DEVICE=/dev/sdb
-
-python3 main.py \
-  --iso-dir "$ISO_DIR" \
-  --device "$USB_DEVICE" \
-  --mount-point /mnt/usb \
-  --boot-size 2 \
-  --auto-confirm \
-  --no-dry-run
-
-echo "✓ Multiboot USB ready at $USB_DEVICE"
-```
-
-### CI/CD Pipeline
-
-```bash
-# Verify ISO directory exists
-test -d "${ISO_DIR}" || exit 1
-
-# Run tool with full automation
-python3 main.py \
-  --iso-dir "${ISO_DIR}" \
-  --device "${USB_DEVICE}" \
-  --auto-confirm \
-  --dry-run  # Use --no-dry-run when confident
-
-# Verify USB mounted successfully
-test -d /mnt/usb/isos || exit 1
-test -f /mnt/usb/boot/grub/grub.cfg || exit 1
-```
-
 ## Security & Auditing
 
 - **No network calls** - Fully offline operation
@@ -322,21 +266,6 @@ test -f /mnt/usb/boot/grub/grub.cfg || exit 1
 - **Source code available** - All code is plain-text Python
 - **Standard tools only** - Uses GRUB2, parted, mkfs from your distro
 - **Reproducible** - Same inputs produce identical results
-
-### Code Review
-
-Verify what the tool does:
-
-```bash
-# Check all subprocess calls
-grep -n "subprocess\|run_cmd" main.py
-
-# Count lines of code
-wc -l main.py
-
-# Python syntax check
-python3 -m py_compile main.py
-```
 
 ## License
 
