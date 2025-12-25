@@ -11,6 +11,7 @@ import sys
 import subprocess
 import shutil
 import time
+import urllib.request
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 
@@ -49,7 +50,6 @@ class USBFormatter:
 
     def list_disks(self) -> List[Dict]:
         """List all block devices with sizes."""
-        # Always execute this (not affected by dry_run) - it's just reading state
         try:
             result = subprocess.run(
                 ["lsblk", "-bdno", "NAME,SIZE,TYPE"],
@@ -78,8 +78,18 @@ class USBFormatter:
 
         return devices
 
-    def confirm_device(self) -> bool:
-        """Display disks and confirm device selection."""
+    def check_existing_setup(self) -> bool:
+        """Check if device looks like it was already set up by this tool."""
+        # Simple heuristic: Check if partition 1 and 2 exist
+        p1 = Path(self.boot_partition)
+        p2 = Path(self.iso_partition)
+        
+        if p1.exists() and p2.exists():
+            return True
+        return False
+
+    def confirm_device(self) -> str:
+        """Display disks and confirm device selection. Returns 'wipe' or 'update'."""
         print("\n📋 Available USB devices:")
         devices = self.list_disks()
 
@@ -96,14 +106,31 @@ class USBFormatter:
             print(f"✗ Device not found: {self.device}")
             sys.exit(1)
 
-        print(f"\n⚠️  WARNING: This will erase all data on {self.device} ({selected['size_gb']:.1f} GB)")
-        response = input("Continue? [yes/NO]: ")
-
-        if response.lower() != "yes":
-            print("Aborted.")
+        # Check for existing setup
+        is_existing = self.check_existing_setup()
+        
+        if is_existing:
+            print(f"\n⚠️  Existing partitions detected on {self.device}.")
+            print("   [1] Update ISOs/Config only (Keep partitions)")
+            print("   [2] Full Wipe & Reinstall (Erase everything)")
+            choice = input("Select option [1/2]: ").strip()
+            
+            if choice == "1":
+                return "update"
+            elif choice == "2":
+                print(f"\n⚠️  WARNING: This will erase all data on {self.device} ({selected['size_gb']:.1f} GB)")
+                if input("Confirm full wipe? [yes/NO]: ").lower() == "yes":
+                    return "wipe"
+                sys.exit(0)
+            else:
+                print("Aborted.")
+                sys.exit(0)
+        else:
+            print(f"\n⚠️  WARNING: This will erase all data on {self.device} ({selected['size_gb']:.1f} GB)")
+            response = input("Continue? [yes/NO]: ")
+            if response.lower() == "yes":
+                return "wipe"
             sys.exit(0)
-
-        return True
 
     def wipe_device(self):
         """Securely wipe device."""
@@ -116,21 +143,17 @@ class USBFormatter:
         print(f"   Partition 1 (Boot):  {boot_size_mb} MB")
         print("   Partition 2 (ISOs):  Remaining space")
 
-        # MBR partition table
         self.run_cmd(["parted", "-s", self.device, "mklabel", "msdos"], needs_sudo=True)
 
-        # Align partition 1 to 1MiB
         start = "1MiB"
         end = f"{boot_size_mb + 1}MiB"
 
-        # Boot partition (ext4)
         self.run_cmd(
             ["parted", "-s", self.device, "mkpart", "primary", "ext4", start, end],
             needs_sudo=True,
         )
         self.run_cmd(["parted", "-s", self.device, "set", "1", "boot", "on"], needs_sudo=True)
 
-        # ISO partition (ext4 or exfat)
         self.run_cmd(
             ["parted", "-s", self.device, "mkpart", "primary", iso_format, end, "100%"],
             needs_sudo=True,
@@ -141,7 +164,7 @@ class USBFormatter:
         print("\n💾 Formatting partitions...")
 
         if not self.dry_run:
-            time.sleep(1)  # Wait for partitions to appear
+            time.sleep(1)
 
         print(f"   {self.boot_partition} → ext4 (BOOT)")
         self.run_cmd(["mkfs.ext4", "-F", "-L", "BOOT", self.boot_partition], needs_sudo=True)
@@ -151,7 +174,7 @@ class USBFormatter:
             self.run_cmd(
                 ["mkfs.ext4", "-F", "-L", "ISOs", self.iso_partition], needs_sudo=True
             )
-        else:  # exfat
+        else:
             self.run_cmd(
                 ["mkfs.exfat", "-n", "ISOs", self.iso_partition], needs_sudo=True
             )
@@ -170,10 +193,9 @@ class GRUBInstaller:
         self.iso_partition = f"{device}2"
 
     def run_cmd(self, cmd: List[str], needs_sudo: bool = False) -> Tuple[int, str]:
-        """Execute command."""
         if needs_sudo and os.geteuid() != 0:
             cmd = ["sudo"] + cmd
-
+        
         cmd_str = " ".join(cmd)
         print(f"→ {cmd_str}")
 
@@ -190,37 +212,29 @@ class GRUBInstaller:
             raise
 
     def mount_partitions(self):
-        """Mount USB partitions."""
         print("\n🔗 Mounting partitions...")
 
         if self.dry_run:
             print(f"   {self.boot_partition} → {self.boot_mount}")
             print(f"   {self.iso_partition} → {self.iso_mount}")
-            return  # <--- RETURN EARLY IN DRY RUN
+            return
 
         self.mount_point.mkdir(parents=True, exist_ok=True)
         self.boot_mount.mkdir(exist_ok=True)
         self.iso_mount.mkdir(exist_ok=True)
 
-        print(f"   {self.boot_partition} → {self.boot_mount}")
         self.run_cmd(["mount", str(self.boot_partition), str(self.boot_mount)], needs_sudo=True)
-
-        print(f"   {self.iso_partition} → {self.iso_mount}")
         self.run_cmd(["mount", str(self.iso_partition), str(self.iso_mount)], needs_sudo=True)
 
     def install_grub(self):
-        """Install GRUB2 bootloader."""
         print("\n🔧 Installing GRUB2...")
-
         if self.dry_run:
-            print(f"   → grub-install --force --no-floppy --boot-directory={self.boot_mount} {self.device}")
-            return  # <--- RETURN EARLY IN DRY RUN
+            print(f"   → grub-install ... {self.device}")
+            return
 
-        # Create boot directory structure
         grub_dir = self.boot_mount / "grub"
         grub_dir.mkdir(parents=True, exist_ok=True)
 
-        # Install bootloader
         self.run_cmd(
             [
                 "grub-install",
@@ -232,145 +246,187 @@ class GRUBInstaller:
             needs_sudo=True,
         )
 
+    def ensure_wimboot(self):
+        """Download wimboot if needed."""
+        wimboot_path = self.boot_mount / "grub" / "wimboot"
+        if self.dry_run or wimboot_path.exists():
+            return
+
+        print("\n📥 Downloading wimboot (for Windows/PE support)...")
+        url = "https://github.com/ipxe/wimboot/releases/latest/download/wimboot"
+        try:
+            urllib.request.urlretrieve(url, wimboot_path)
+            print("   ✓ wimboot downloaded")
+        except Exception as e:
+            print(f"   ⚠️ Failed to download wimboot: {e}")
+
     def copy_isos(self, iso_dir: Optional[Path]) -> Dict[str, float]:
-        """Copy ISO files to USB."""
-        print("\n📝 Copying ISO files...")
-        
-        # Always create the folder structure
+        print("\n📝 Syncing ISO files...")
         iso_folder = self.iso_mount / "isos"
+        
         if not self.dry_run:
             iso_folder.mkdir(exist_ok=True)
+            # Make accessible to all users
+            subprocess.run(["sudo", "chmod", "777", str(iso_folder)], check=False)
 
         isos = {}
         
+        # Scan what's already on the USB (in case of update mode)
+        if not self.dry_run:
+             for existing in iso_folder.glob("*.iso"):
+                size_gb = existing.stat().st_size / (1024 ** 3)
+                isos[existing.name] = size_gb
+
         if not iso_dir:
-            print("   (No ISO directory specified - skipping copy)")
+            print("   (No source directory - using existing files only)")
             return isos
 
         iso_files = sorted(iso_dir.glob("*.iso"))
-        if not iso_files:
-            print("⚠️  No ISO files found in directory")
-            return isos
-
         for iso_file in iso_files:
             size_gb = iso_file.stat().st_size / (1024 ** 3)
             isos[iso_file.name] = size_gb
-            print(f"   {iso_file.name:50} {size_gb:6.2f} GB")
+            
+            # Check if we need to copy
+            dst = iso_folder / iso_file.name
+            if self.dry_run:
+                print(f"   + {iso_file.name:50} {size_gb:6.2f} GB")
+                continue
 
-            if not self.dry_run:
-                dst = iso_folder / iso_file.name
-                shutil.copy2(iso_file, dst)
+            if dst.exists():
+                if dst.stat().st_size == iso_file.stat().st_size:
+                    print(f"   = {iso_file.name} (Up to date)")
+                    continue
+            
+            print(f"   > Copying {iso_file.name}...")
+            shutil.copy2(iso_file, dst)
+            # Fix permissions on the file
+            subprocess.run(["sudo", "chmod", "666", str(dst)], check=False)
 
         return isos
 
     def generate_grub_config(self, isos: Dict[str, float]) -> str:
-        """Generate grub.cfg for multiboot."""
-        config = """# GRUB2 Multiboot Configuration
-# Auto-generated for GRUB2 Multiboot USB Creator
+        """Generate grub.cfg with robust distro detection."""
+        
+        # Check for Windows/Hiren's
+        has_windows = any(x for x in isos.keys() if "win" in x.lower() or "hiren" in x.lower())
+        if has_windows and not self.dry_run:
+            self.ensure_wimboot()
 
+        config = """# GRUB2 Multiboot Configuration
 set default=0
 set timeout=10
+set pager=1
 
-### Boot Entries ###
+insmod part_msdos
+insmod part_gpt
+insmod ext2
+insmod search_fs_uuid
+insmod ntfs
+insmod iso9660
+
+if [ -e ($root)/boot/grub/wimboot ]; then
+    set wimboot=($root)/boot/grub/wimboot
+fi
 """
 
-        for idx, iso_name in enumerate(sorted(isos.keys())):
+        for iso_name in sorted(isos.keys()):
             label = iso_name.replace(".iso", "").replace("_", " ")
-            config += f'''
-menuentry "{label}" {{
-    echo "Loading {label}..."
-    set isofile=/isos/{iso_name}
+            path = f"/isos/{iso_name}"
+            lower = iso_name.lower()
+
+            if "win" in lower or "hiren" in lower:
+                config += f'''
+menuentry "{label} (Windows/PE)" {{
+    set isofile="{path}"
     loopback loop $isofile
-    insmod gfxterm
-    terminal_output gfxterm
-    
-    linux (loop)/casper/vmlinuz iso-scan/filename=$isofile boot=casper noeject noprompt splash --
+    linux16 $wimboot
+    initrd16 newc:bootmgr:(loop)/bootmgr newc:bcd:(loop)/boot/bcd newc:boot.sdi:(loop)/boot/boot.sdi newc:boot.wim:(loop)/sources/boot.wim
+}}
+'''
+            elif "nixos" in lower:
+                config += f'''
+menuentry "{label}" {{
+    set isofile="{path}"
+    loopback loop $isofile
+    linux (loop)/boot/bzImage init=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-nixos-system-*-*/init findiso=$isofile
+    initrd (loop)/boot/initrd
+}}
+'''
+            elif "tails" in lower:
+                config += f'''
+menuentry "{label}" {{
+    set isofile="{path}"
+    loopback loop $isofile
+    linux (loop)/live/vmlinuz boot=live config findiso=$isofile live-media=removable apparmor=1 security=apparmor nopersistence noprompt timezone=Etc/UTC block.events_dfl_poll_msecs=1000 splash noautologin module=Tails
+    initrd (loop)/live/initrd.img
+}}
+'''
+            elif "arch" in lower:
+                config += f'''
+menuentry "{label}" {{
+    set isofile="{path}"
+    loopback loop $isofile
+    probe -u $root --set=rootuuid
+    linux (loop)/arch/boot/x86_64/vmlinuz-linux archisobasedir=arch archisolabel=ARCH_202X img_dev=/dev/disk/by-uuid/$rootuuid img_loop=$isofile earlymodules=loop
+    initrd (loop)/arch/boot/intel-ucode.img (loop)/arch/boot/amd-ucode.img (loop)/arch/boot/x86_64/initramfs-linux.img
+}}
+'''
+            elif "fedora" in lower or "rhel" in lower:
+                config += f'''
+menuentry "{label}" {{
+    set isofile="{path}"
+    loopback loop $isofile
+    linux (loop)/images/pxeboot/vmlinuz iso-scan/filename=$isofile root=live:CDLABEL=Fedora-WS-Live-*-*-* ro rd.live.image quiet
+    initrd (loop)/images/pxeboot/initrd.img
+}}
+'''
+            else:
+                config += f'''
+menuentry "{label}" {{
+    set isofile="{path}"
+    loopback loop $isofile
+    linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=$isofile noeject noprompt splash --
     initrd (loop)/casper/initrd
 }}
 '''
 
         config += """
-### System Utilities ###
-menuentry "UEFI Firmware Settings" {
-    fwsetup
-}
-
-menuentry "Reboot" {
-    reboot
-}
-
-menuentry "Power Off" {
-    halt
-}
+menuentry "UEFI Firmware Settings" { fwsetup }
+menuentry "Reboot" { reboot }
+menuentry "Power Off" { halt }
 """
-
         return config
 
     def write_grub_config(self, config: str):
-        """Write grub.cfg file."""
         print("\n⚙️  Writing GRUB configuration...")
-
         grub_cfg = self.boot_mount / "grub" / "grub.cfg"
-        print(f"   {grub_cfg}")
-
         if not self.dry_run:
             grub_cfg.write_text(config)
             os.chmod(grub_cfg, 0o644)
 
     def unmount_partitions(self):
-        """Safely unmount USB."""
         print("\n🔌 Unmounting...")
-
-        if self.dry_run:
-            print(f"   {self.boot_mount}")
-            print(f"   {self.iso_mount}")
-            return  # <--- RETURN EARLY IN DRY RUN
-
+        if self.dry_run: return
         for mount in [self.boot_mount, self.iso_mount]:
             if mount.exists():
-                print(f"   {mount}")
                 subprocess.run(["sudo", "umount", str(mount)], capture_output=True)
+
 
 def main():
     import argparse
-
     parser = argparse.ArgumentParser(
         description="Create secure GRUB2 multiboot USB drives",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  Interactive (recommended):
-    python3 main.py --iso-dir ~/isos
-
-  Automated dry-run:
-    python3 main.py --iso-dir ~/isos --device /dev/sdb --auto-confirm
-
-  Execute (no dry-run):
-    python3 main.py --iso-dir ~/isos --device /dev/sdb --auto-confirm --no-dry-run
-        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
     parser.add_argument("--iso-dir", "-i", help="Directory with ISO files")
     parser.add_argument("--device", "-d", help="USB device (e.g., /dev/sdb)")
     parser.add_argument("--mount-point", "-m", default="/mnt/usb", help="Mount point")
-    parser.add_argument(
-        "--boot-size-mb", "--boot-size",
-        dest="boot_size_mb",
-        type=int,
-        default=256,
-        help="Boot partition size in MB (default: 256).",
-    )
-    parser.add_argument(
-        "--iso-format",
-        choices=["ext4", "exfat"],
-        default="ext4",
-        help="ISO partition format",
-    )
-    parser.add_argument("--dry-run", action="store_true", default=True, help="Preview mode")
-    parser.add_argument(
-        "--no-dry-run", dest="dry_run", action="store_false", help="Execute changes"
-    )
-    parser.add_argument("--auto-confirm", action="store_true", help="Skip confirmation prompts")
+    parser.add_argument("--boot-size-mb", type=int, default=256, help="Boot partition size in MB")
+    parser.add_argument("--iso-format", choices=["ext4", "exfat"], default="ext4")
+    parser.add_argument("--dry-run", action="store_true", default=True)
+    parser.add_argument("--no-dry-run", dest="dry_run", action="store_false")
+    parser.add_argument("--auto-confirm", action="store_true")
 
     args = parser.parse_args()
 
@@ -379,7 +435,6 @@ Examples:
         print("  Re-run as: sudo python3 main.py ...")
         sys.exit(1)
 
-    # Verify ISO directory if provided
     iso_dir = None
     if args.iso_dir:
         iso_dir = Path(args.iso_dir).expanduser()
@@ -387,20 +442,19 @@ Examples:
             print(f"✗ ISO directory not found: {iso_dir}")
             sys.exit(1)
 
-    # Interactive device selection if needed
     device = args.device
     if not device:
         formatter = USBFormatter("/dev/null", dry_run=True)
         devices = formatter.list_disks()
-
+        
         print("\n📋 Available USB devices:")
         for idx, dev in enumerate(devices, 1):
             print(f"   {idx}. {dev['device']:15} {dev['size_gb']:7.1f} GB")
-
+        
         if not devices:
             print("✗ No USB devices detected")
             sys.exit(1)
-
+        
         try:
             choice = input(f"\nSelect device [1-{len(devices)}]: ")
             device = devices[int(choice) - 1]["device"]
@@ -408,51 +462,48 @@ Examples:
             print("✗ Invalid selection")
             sys.exit(1)
 
-    # Run workflow
+    # Detect mode (Wipe or Update)
+    formatter = USBFormatter(device, dry_run=args.dry_run)
+    mode = "wipe"
+    if not args.auto_confirm:
+        mode = formatter.confirm_device()
+
     print("\n" + "=" * 60)
     print("GRUB2 Multiboot USB Creator")
     print("=" * 60)
-    print(f"ISO Directory:   {iso_dir if iso_dir else '(None - creating empty folder)'}")
+    print(f"Mode:            {mode.upper()}")
     print(f"USB Device:      {device}")
     print(f"Mount Point:     {args.mount_point}")
-    print(f"Boot Size:       {args.boot_size_mb} MB")
-    print(f"ISO Format:      {args.iso_format}")
     print(f"Dry-Run Mode:    {args.dry_run}")
     print("=" * 60)
 
-    # Step 1: Format USB
-    formatter = USBFormatter(device, dry_run=args.dry_run)
-
-    if not args.auto_confirm:
-        formatter.confirm_device()
-
-    formatter.wipe_device()
-    formatter.create_partitions(args.boot_size_mb, args.iso_format)
-    formatter.format_partitions(args.iso_format)
-
-    # Step 2: Install GRUB
+    # Execute workflow based on mode
     installer = GRUBInstaller(device, args.mount_point, dry_run=args.dry_run)
-    installer.mount_partitions()
-    installer.install_grub()
 
-    # Step 3: Copy ISOs (if any) and configure GRUB
+    if mode == "wipe":
+        formatter.wipe_device()
+        formatter.create_partitions(args.boot_size_mb, args.iso_format)
+        formatter.format_partitions(args.iso_format)
+        installer.mount_partitions()
+        installer.install_grub()
+    else:
+        # Update mode: just mount
+        print("\n📂 Keeping existing partitions...")
+        installer.mount_partitions()
+
+    # Common steps (sync ISOs + Config)
     isos = installer.copy_isos(iso_dir)
     config = installer.generate_grub_config(isos)
     installer.write_grub_config(config)
 
-    # Step 4: Unmount
     installer.unmount_partitions()
 
-    # Summary
     print("\n" + "=" * 60)
     if args.dry_run:
         print("✓ Dry-run complete (no changes made)")
-        print("  Run with --no-dry-run to execute")
     else:
         print("✓ Multiboot USB ready!")
-        print(f"  Boot from {device} to use GRUB2 menu")
     print("=" * 60)
-
 
 if __name__ == "__main__":
     main()
