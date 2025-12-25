@@ -1,0 +1,11 @@
+# GRUB2 Multiboot USB Creator - Dependencies
+# This project uses only Python standard library
+# No external packages required for basic functionality
+
+# Optional: For better terminal output (Windows compatibility)
+# colorama>=0.4.3
+
+# Development/testing only (not needed for normal use):
+# pytest>=7.0
+# black>=22.0
+# mypy>=0.990
