@@ -419,7 +419,7 @@ class GRUBInstaller:
 
     def generate_grub_config(self, isos: Dict[str, float], *, allow_wimboot_download: bool) -> str:
         """
-        Generate grub.cfg with valid GRUB2 syntax and file existence checks.
+        Generate grub.cfg with robust distro detection and loopback cleanup.
         """
         # If Windows/Hiren detected, ensure wimboot is present (or warn).
         has_windows = any(
@@ -444,21 +444,19 @@ insmod iso9660
 insmod ntfs
 insmod loopback
 
-# 1. Search for BOOT partition
+# Quietly find partitions using hints to avoid "device not found" noise
 search --no-floppy --label BOOT --set=bootpart --hint ($root)
-
-# 2. Search for ISOs partition
 search --no-floppy --label ISOs --set=isopart --hint ($root)
 
-# 3. Fallback if search failed (e.g. no labels)
+# Fallback if label search fails
 if [ -z "$isopart" ]; then
-    set isopart=($root)2
+    set isopart=($root)
 fi
 
-# 4. Probe UUID (for Linux loopback)
+# Get UUID of ISO partition for Linux kernels
 probe -u $isopart --set=isouuid
 
-# 5. Load wimboot
+# wimboot (if installed)
 if [ -e ($bootpart)/grub/wimboot ]; then
   set wimboot=($bootpart)/grub/wimboot
 fi
@@ -483,56 +481,63 @@ fi
   loopback loop ($isopart)$isofile
   
   if [ -z "$wimboot" ]; then
-    echo "wimboot not found! Run with --download-wimboot"
+    echo "wimboot not found at ($bootpart)/grub/wimboot"
+    echo "Install it or rerun with --download-wimboot"
     sleep 5
   else
+    # SHOTGUN MAPPING: Map every possible case/name to ensure wimboot finds it.
     linux16 $wimboot
-    
-    # Check for bootmgr case sensitivity
-    if [ -e (loop)/bootmgr ]; then
-       set bootmgr=(loop)/bootmgr
-    elif [ -e (loop)/BOOTMGR ]; then
-       set bootmgr=(loop)/BOOTMGR
-    elif [ -e (loop)/bootmgr.exe ]; then
-       set bootmgr=(loop)/bootmgr.exe
-    elif [ -e (loop)/BOOTMGR.EXE ]; then
-       set bootmgr=(loop)/BOOTMGR.EXE
-    fi
-    
-    # Check for BCD case sensitivity
-    if [ -e (loop)/boot/bcd ]; then
-       set bcd=(loop)/boot/bcd
-    elif [ -e (loop)/BOOT/BCD ]; then
-       set bcd=(loop)/BOOT/BCD
-    fi
-
-    # Check for boot.sdi case sensitivity
-    if [ -e (loop)/boot/boot.sdi ]; then
-       set bootsdi=(loop)/boot/boot.sdi
-    elif [ -e (loop)/BOOT/BOOT.SDI ]; then
-       set bootsdi=(loop)/BOOT/BOOT.SDI
-    fi
-    
-    # Check for boot.wim case sensitivity
-    if [ -e (loop)/sources/boot.wim ]; then
-       set bootwim=(loop)/sources/boot.wim
-    elif [ -e (loop)/SOURCES/BOOT.WIM ]; then
-       set bootwim=(loop)/SOURCES/BOOT.WIM
-    fi
-
-    # Map the files we found
     initrd16 \\
-      newc:bootmgr:$bootmgr \\
-      newc:bcd:$bcd \\
-      newc:boot.sdi:$bootsdi \\
-      newc:boot.wim:$bootwim
+      newc:bootmgr:(loop)/bootmgr \\
+      newc:bootmgr:(loop)/BOOTMGR \\
+      newc:bootmgr.exe:(loop)/bootmgr.exe \\
+      newc:bootmgr.exe:(loop)/BOOTMGR.EXE \\
+      newc:bcd:(loop)/boot/bcd \\
+      newc:bcd:(loop)/BOOT/BCD \\
+      newc:boot.sdi:(loop)/boot/boot.sdi \\
+      newc:boot.sdi:(loop)/BOOT/BOOT.SDI \\
+      newc:boot.wim:(loop)/sources/boot.wim \\
+      newc:boot.wim:(loop)/SOURCES/BOOT.WIM
   fi
 """
                 cfg += _menuentry(f"{label} (Windows/PE)", body)
                 continue
 
             # ---------------------------------------------------------
-            # 2. Tails
+            # 2. NixOS (Fixed: Use internal loopback.cfg)
+            # ---------------------------------------------------------
+            if "nixos" in low:
+                body = f"""  set isofile="{isofile}"
+  loopback --delete loop
+  loopback loop ($isopart)$isofile
+  
+  # NixOS ISOs ship with a specialized GRUB config for loopback booting.
+  # We just chainload it.
+  if [ -e (loop)/boot/grub/loopback.cfg ]; then
+      configfile (loop)/boot/grub/loopback.cfg
+  else
+      echo "No loopback.cfg found in NixOS ISO."
+      sleep 5
+  fi
+"""
+                cfg += _menuentry(label, body)
+                continue
+
+            # ---------------------------------------------------------
+            # 3. Debian Installer (Netinst/DVD) - Preserved your fix
+            # ---------------------------------------------------------
+            if "debian" in low and "netinst" in low:
+                body = f"""  set isofile="{isofile}"
+  loopback --delete loop
+  loopback loop ($isopart)$isofile
+  linux (loop)/install.amd/vmlinuz vga=788 --- quiet
+  initrd (loop)/install.amd/initrd.gz
+"""
+                cfg += _menuentry(label, body)
+                continue
+
+            # ---------------------------------------------------------
+            # 4. Tails
             # ---------------------------------------------------------
             if "tails" in low:
                 body = f"""  set isofile="{isofile}"
@@ -545,7 +550,7 @@ fi
                 continue
 
             # ---------------------------------------------------------
-            # 3. SystemRescue
+            # 5. SystemRescue
             # ---------------------------------------------------------
             if "systemrescue" in low or "sysresccd" in low:
                 body = f"""  set isofile="{isofile}"
@@ -553,11 +558,14 @@ fi
   loopback loop ($isopart)$isofile
   
   if [ -e (loop)/sysresccd/boot/x86_64/vmlinuz ]; then
-      # Arch-based (Modern)
-      linux (loop)/sysresccd/boot/x86_64/vmlinuz archisobasedir=sysresccd archisolabel=RESCUE* img_dev=/dev/disk/by-uuid/$isouuid img_loop=$isofile earlymodules=loop
+      if [ -n "$isouuid" ]; then
+          set imgdev="/dev/disk/by-uuid/$isouuid"
+      else
+          set imgdev="$isopart" 
+      fi
+      linux (loop)/sysresccd/boot/x86_64/vmlinuz archisobasedir=sysresccd archisolabel=RESCUE* img_dev=$imgdev img_loop=$isofile earlymodules=loop
       initrd (loop)/sysresccd/boot/x86_64/sysresccd.img
   else
-      # Debian-based (Legacy)
       linux (loop)/isolinux/rescue64 isoloop=$isofile
       initrd (loop)/isolinux/initram.igz
   fi
@@ -566,62 +574,37 @@ fi
                 continue
 
             # ---------------------------------------------------------
-            # 4. Debian (Netinst/Installer)
+            # 6. Debian-live family (Clonezilla, GParted, Kali, Ubuntu)
             # ---------------------------------------------------------
-            if "debian" in low:
+            if any(x in low for x in ["clonezilla", "gparted", "debian", "kali", "ubuntu", "pop", "mint"]):
+                extra = ""
+                if "clonezilla" in low:
+                    extra = "union=overlay components quiet noswap"
+                
+                # Check for casper (Ubuntu/Mint) vs live (Debian/Kali)
+                # We can do this dynamically in GRUB
                 body = f"""  set isofile="{isofile}"
   loopback --delete loop
   loopback loop ($isopart)$isofile
   
-  # Check for standard Live kernel
-  if [ -e (loop)/live/vmlinuz ]; then
-      linux (loop)/live/vmlinuz boot=live findiso=$isofile
+  if [ -e (loop)/casper/vmlinuz ]; then
+      linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=$isofile noeject noprompt splash --
+      initrd (loop)/casper/initrd
+  elif [ -e (loop)/live/vmlinuz ]; then
+      linux (loop)/live/vmlinuz boot=live findiso=$isofile {extra}
       initrd (loop)/live/initrd.img
-  
-  # Check for Installer kernel (netinst)
-  elif [ -e (loop)/install.amd/vmlinuz ]; then
-      linux (loop)/install.amd/vmlinuz vga=788 priority=low --- 
-      initrd (loop)/install.amd/initrd.gz
-  fi
-"""
-                cfg += _menuentry(label, body)
-                continue
-
-            # ---------------------------------------------------------
-            # 5. NixOS
-            # ---------------------------------------------------------
-            if "nixos" in low:
-                body = f"""  set isofile="{isofile}"
-  loopback --delete loop
-  loopback loop ($isopart)$isofile
-  
-  linux (loop)/boot/bzImage findiso=$isofile init=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-nixos-system-*-*/init
-  # NixOS initrd often has no extension
-  if [ -e (loop)/boot/initrd ]; then
-      initrd (loop)/boot/initrd
   else
-      initrd (loop)/boot/initrd.img
+      echo "Could not find kernel in /casper or /live"
+      sleep 5
   fi
 """
                 cfg += _menuentry(label, body)
                 continue
 
             # ---------------------------------------------------------
-            # 6. Generic Fallbacks (Ubuntu, Arch, Fedora)
+            # 7. Arch family
             # ---------------------------------------------------------
-            # Ubuntu/Casper
-            if any(x in low for x in ["ubuntu", "mint", "pop", "neon", "elementary"]):
-                body = f"""  set isofile="{isofile}"
-  loopback --delete loop
-  loopback loop ($isopart)$isofile
-  linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=$isofile noeject noprompt splash --
-  initrd (loop)/casper/initrd
-"""
-                cfg += _menuentry(label, body)
-                continue
-
-            # Arch/Manjaro
-            if any(x in low for x in ["arch", "manjaro", "endeavour"]):
+            if any(x in low for x in ["arch", "manjaro", "endeavouros", "endeavour"]):
                 body = f"""  set isofile="{isofile}"
   loopback --delete loop
   loopback loop ($isopart)$isofile
@@ -631,6 +614,30 @@ fi
 """
                 cfg += _menuentry(label, body)
                 continue
+
+            # ---------------------------------------------------------
+            # 8. Fedora/RHEL
+            # ---------------------------------------------------------
+            if any(x in low for x in ["fedora", "rhel", "centos", "rocky", "alma"]):
+                body = f"""  set isofile="{isofile}"
+  loopback --delete loop
+  loopback loop ($isopart)$isofile
+  linux (loop)/images/pxeboot/vmlinuz iso-scan/filename=$isofile rd.live.image quiet
+  initrd (loop)/images/pxeboot/initrd.img
+"""
+                cfg += _menuentry(label, body)
+                continue
+
+            # ---------------------------------------------------------
+            # 9. Generic Fallback
+            # ---------------------------------------------------------
+            body = f"""  set isofile="{isofile}"
+  loopback --delete loop
+  loopback loop ($isopart)$isofile
+  linux (loop)/boot/vmlinuz iso-scan/filename=$isofile quiet
+  initrd (loop)/boot/initrd
+"""
+            cfg += _menuentry(label, body)
 
         cfg += """
 ### Utilities ###
