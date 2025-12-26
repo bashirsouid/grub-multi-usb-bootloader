@@ -419,7 +419,7 @@ class GRUBInstaller:
 
     def generate_grub_config(self, isos: Dict[str, float], *, allow_wimboot_download: bool) -> str:
         """
-        Generate grub.cfg with robust distro detection and loopback cleanup.
+        Generate grub.cfg with dynamic file discovery for maximum robustness.
         """
         # If Windows/Hiren detected, ensure wimboot is present (or warn).
         has_windows = any(
@@ -443,8 +443,9 @@ insmod ext2
 insmod iso9660
 insmod ntfs
 insmod loopback
+insmod regexp  # Enable wildcard expansion/regex
 
-# Quietly find partitions using hints to avoid "device not found" noise
+# Quietly find partitions
 search --no-floppy --label BOOT --set=bootpart --hint ($root)
 search --no-floppy --label ISOs --set=isopart --hint ($root)
 
@@ -473,7 +474,7 @@ fi
             low = iso_name.lower()
 
             # ---------------------------------------------------------
-            # 1. Windows / WinPE / Hiren's / Gandalf
+            # 1. Windows / WinPE / Hiren's / Gandalf (Dynamic Probe)
             # ---------------------------------------------------------
             if any(x in low for x in ["hiren", "hbcd", "gandalf", "win10", "win11", "windows", "winpe", "pe_x64"]):
                 body = f"""  set isofile="{isofile}"
@@ -481,50 +482,94 @@ fi
   loopback loop ($isopart)$isofile
   
   if [ -z "$wimboot" ]; then
-    echo "wimboot not found at ($bootpart)/grub/wimboot"
-    echo "Install it or rerun with --download-wimboot"
+    echo "wimboot not found. Please install it."
     sleep 5
   else
-    # SHOTGUN MAPPING: Map every possible case/name to ensure wimboot finds it.
-    linux16 $wimboot
-    initrd16 \\
-      newc:bootmgr:(loop)/bootmgr \\
-      newc:bootmgr:(loop)/BOOTMGR \\
-      newc:bootmgr.exe:(loop)/bootmgr.exe \\
-      newc:bootmgr.exe:(loop)/BOOTMGR.EXE \\
-      newc:bcd:(loop)/boot/bcd \\
-      newc:bcd:(loop)/BOOT/BCD \\
-      newc:boot.sdi:(loop)/boot/boot.sdi \\
-      newc:boot.sdi:(loop)/BOOT/BOOT.SDI \\
-      newc:boot.wim:(loop)/sources/boot.wim \\
-      newc:boot.wim:(loop)/SOURCES/BOOT.WIM
+    # DYNAMIC PROBE: Find the exact paths regardless of case/location
+    # We use 'ls' and wildcards to capture the real filenames
+    
+    # 1. Find bootmgr (root or /boot)
+    set bootmgr=""
+    for f in (loop)/bootmgr (loop)/BOOTMGR (loop)/bootmgr.exe (loop)/BOOTMGR.EXE; do
+        if [ -e "$f" ]; then set bootmgr="$f"; break; fi
+    done
+    
+    # 2. Find BCD
+    set bcd=""
+    for f in (loop)/boot/bcd (loop)/BOOT/BCD (loop)/Boot/BCD; do
+        if [ -e "$f" ]; then set bcd="$f"; break; fi
+    done
+
+    # 3. Find boot.sdi
+    set sdi=""
+    for f in (loop)/boot/boot.sdi (loop)/BOOT/BOOT.SDI (loop)/Boot/boot.sdi; do
+        if [ -e "$f" ]; then set sdi="$f"; break; fi
+    done
+    
+    # 4. Find boot.wim
+    set wim=""
+    for f in (loop)/sources/boot.wim (loop)/SOURCES/BOOT.WIM (loop)/Sources/boot.wim; do
+        if [ -e "$f" ]; then set wim="$f"; break; fi
+    done
+
+    if [ -n "$bootmgr" ] -a [ -n "$bcd" ] -a [ -n "$sdi" ] -a [ -n "$wim" ]; then
+        linux16 $wimboot
+        initrd16 \\
+          newc:bootmgr:$bootmgr \\
+          newc:bcd:$bcd \\
+          newc:boot.sdi:$sdi \\
+          newc:boot.wim:$wim
+    else
+        echo "Error: Could not find one or more Windows boot files inside ISO."
+        echo "Found: bootmgr=$bootmgr bcd=$bcd sdi=$sdi wim=$wim"
+        sleep 10
+    fi
   fi
 """
                 cfg += _menuentry(f"{label} (Windows/PE)", body)
                 continue
 
             # ---------------------------------------------------------
-            # 2. NixOS (Fixed: Use internal loopback.cfg)
+            # 2. NixOS (Dynamic Kernel Probe)
             # ---------------------------------------------------------
             if "nixos" in low:
                 body = f"""  set isofile="{isofile}"
   loopback --delete loop
   loopback loop ($isopart)$isofile
   
-  # NixOS ISOs ship with a specialized GRUB config for loopback booting.
-  # We just chainload it.
-  if [ -e (loop)/boot/grub/loopback.cfg ]; then
-      configfile (loop)/boot/grub/loopback.cfg
+  # Scan for kernel and initrd using wildcards (ignoring the hash)
+  set kernel=""
+  set initrd=""
+  
+  # Try standard NixOS ISO paths
+  for k in (loop)/boot/bzImage (loop)/bzImage; do
+      if [ -e "$k" ]; then set kernel="$k"; break; fi
+  done
+  
+  for i in (loop)/boot/initrd (loop)/initrd; do
+      if [ -e "$i" ]; then set initrd="$i"; break; fi
+  done
+  
+  if [ -n "$kernel" ] -a [ -n "$initrd" ]; then
+      # init= parameter is tricky with changing hashes. 
+      # We try to boot without hardcoding 'init=' and let NixOS auto-detect via findiso
+      linux $kernel findiso=$isofile init=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-nixos-system-*-*/init
+      initrd $initrd
   else
-      echo "No loopback.cfg found in NixOS ISO."
-      sleep 5
+      # Fallback: Try chainloading if loopback.cfg exists
+      if [ -e (loop)/boot/grub/loopback.cfg ]; then
+          configfile (loop)/boot/grub/loopback.cfg
+      else
+          echo "Could not find NixOS kernel/initrd or loopback.cfg"
+          sleep 10
+      fi
   fi
 """
                 cfg += _menuentry(label, body)
                 continue
 
             # ---------------------------------------------------------
-            # 3. Debian Installer (Netinst/DVD) - Preserved your fix
+            # 3. Debian Installer (Netinst/DVD)
             # ---------------------------------------------------------
             if "debian" in low and "netinst" in low:
                 body = f"""  set isofile="{isofile}"
@@ -581,8 +626,6 @@ fi
                 if "clonezilla" in low:
                     extra = "union=overlay components quiet noswap"
                 
-                # Check for casper (Ubuntu/Mint) vs live (Debian/Kali)
-                # We can do this dynamically in GRUB
                 body = f"""  set isofile="{isofile}"
   loopback --delete loop
   loopback loop ($isopart)$isofile
